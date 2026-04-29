@@ -13,3 +13,27 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Android / Gradle
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+
+# Android Studio
+.idea/
+.DS_Store
+
+# Kotlin/Java
+*.class
+
+# Linux/runtime artifacts
+*.log
+*.tmp
+
+# Secrets
+.env
+.env.*
+*.keystore
+*.jks
