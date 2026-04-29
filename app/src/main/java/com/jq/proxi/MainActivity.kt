@@ -666,12 +666,28 @@ class MainActivity : Activity() {
             .setTitle("Linux Setup")
             .setMessage(
                 """
-                adb forward tcp:1080 tcp:1080
-                adb forward tcp:8080 tcp:8080
-                proxi transparent-start
+                1. Install Linux client:
+                   ./linux/install.sh
+
+                2. Connect phone by USB and start Proxi.
+
+                3. Start transparent mode:
+                   proxi transparent-start
+
+                4. Check status:
+                   proxi doctor
+
+                5. Stop and restore:
+                   proxi transparent-stop
+
+                6. Emergency repair:
+                   proxi repair
+
+                Note:
+                Transparent mode supports TCP-focused traffic. UDP, HTTP/3/QUIC, games, and voice/video may not work yet.
                 """.trimIndent()
             )
-            .setPositiveButton("Done", null)
+            .setPositiveButton("OK", null)
             .show()
     }
 

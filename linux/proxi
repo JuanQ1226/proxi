@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOCKS_PORT="1080"
+HTTP_PORT="8080"
+REDSOCKS_PORT="12345"
+PROXY_HOST="127.0.0.1"
+APP_PACKAGE="com.jq.proxi"
+
+REDSOCKS_CONFIG="/etc/redsocks-proxi.conf"
+RESOLV_BACKUP="/etc/resolv.conf.backup.proxi"
+DUMMY_IFACE="proxi-dummy"
+DUMMY_ADDR="198.18.0.1/15"
+
+PROXI_CHAIN="PROXI"
+
+usage() {
+  cat <<EOF
+Proxi Linux CLI
+
+Usage:
+  proxi start                  Setup ADB forwards only
+  proxi stop                   Remove ADB forwards only
+  proxi status                 Show ADB, forwards, and Android service status
+  proxi test                   Test explicit HTTP and SOCKS proxies
+  proxi env                    Print explicit proxy env vars
+  proxi unset                  Print commands to unset proxy env vars
+
+  proxi transparent-start      Start PdaNet-like transparent TCP mode
+  proxi transparent-stop       Stop transparent mode and restore system
+  proxi transparent-restart    Restart transparent mode
+  proxi transparent-status     Show transparent mode status
+
+  proxi doctor                 Run diagnostic checks
+  proxi repair                 Force-clean Proxi networking state
+  proxi open-android           Open Android Proxi app over ADB
+  proxi logs                   Show Android Proxi logs
+
+Android app must be installed and "Start Proxy" must be running.
+EOF
+}
+
+say() {
+  echo "==> $*"
+}
+
+warn() {
+  echo "WARNING: $*" >&2
+}
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_command() {
+  local cmd="$1"
+  local hint="$2"
+
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    fail "$cmd not found. $hint"
+  fi
+}
+
+require_adb() {
+  require_command "adb" "Install it with: sudo pacman -S android-tools"
+}
+
+require_device() {
+  require_adb
+
+  if ! adb devices | grep -q "device$"; then
+    fail "No authorized Android device found. Plug in your phone and accept USB debugging."
+  fi
+}
+
+android_service_running() {
+  adb shell dumpsys activity services "${APP_PACKAGE}" 2>/dev/null | grep -q "ProxyService"
+}
+
+open_android() {
+  require_device
+  say "Opening Android Proxi app..."
+  adb shell monkey -p "${APP_PACKAGE}" 1 >/dev/null
+  echo "Open the app on your phone and press Start Proxy if it is not already running."
+}
+
+start_forwards() {
+  require_device
+
+  say "Setting up ADB forwards..."
+
+  adb forward --remove "tcp:${SOCKS_PORT}" 2>/dev/null || true
+  adb forward --remove "tcp:${HTTP_PORT}" 2>/dev/null || true
+
+  adb forward "tcp:${SOCKS_PORT}" "tcp:${SOCKS_PORT}" >/dev/null
+  adb forward "tcp:${HTTP_PORT}" "tcp:${HTTP_PORT}" >/dev/null
+
+  adb forward --list | grep -E "tcp:(${SOCKS_PORT}|${HTTP_PORT})" || true
+}
+
+stop_forwards() {
+  require_adb
+
+  adb forward --remove "tcp:${SOCKS_PORT}" 2>/dev/null || true
+  adb forward --remove "tcp:${HTTP_PORT}" 2>/dev/null || true
+
+  say "Removed Proxi ADB forwards."
+}
+
+status() {
+  require_adb
+
+  echo "=== ADB devices ==="
+  adb devices
+
+  echo
+  echo "=== ADB forwards ==="
+  adb forward --list | grep -E "tcp:(${SOCKS_PORT}|${HTTP_PORT})" || echo "No Proxi forwards found."
+
+  echo
+  echo "=== Android service ==="
+  if android_service_running; then
+    echo "ProxyService appears to be running."
+  else
+    echo "ProxyService not detected."
+    echo "Open Android app and press Start Proxy."
+  fi
+}
+
+print_env() {
+  cat <<EOF
+export HTTP_PROXY=http://${PROXY_HOST}:${HTTP_PORT}
+export HTTPS_PROXY=http://${PROXY_HOST}:${HTTP_PORT}
+export ALL_PROXY=socks5h://${PROXY_HOST}:${SOCKS_PORT}
+export http_proxy=http://${PROXY_HOST}:${HTTP_PORT}
+export https_proxy=http://${PROXY_HOST}:${HTTP_PORT}
+export all_proxy=socks5h://${PROXY_HOST}:${SOCKS_PORT}
+EOF
+}
+
+print_unset() {
+  cat <<EOF
+unset HTTP_PROXY
+unset HTTPS_PROXY
+unset ALL_PROXY
+unset http_proxy
+unset https_proxy
+unset all_proxy
+EOF
+}
+
+unset_proxy_env_in_current_process() {
+  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy || true
+}
+
+test_explicit_http_proxy() {
+  curl -sS --max-time 10 -x "http://${PROXY_HOST}:${HTTP_PORT}" https://ifconfig.me
+}
+
+test_explicit_socks_proxy() {
+  curl -sS --max-time 10 --socks5-hostname "${PROXY_HOST}:${SOCKS_PORT}" https://ifconfig.me
+}
+
+test_proxy() {
+  require_device
+
+  say "Testing HTTP CONNECT proxy..."
+  test_explicit_http_proxy
+  echo
+  echo "HTTP proxy works."
+
+  echo
+  say "Testing SOCKS5 proxy..."
+  test_explicit_socks_proxy
+  echo
+  echo "SOCKS5 proxy works."
+}
+
+health_check_explicit_proxy() {
+  say "Checking explicit HTTP proxy..."
+
+  for _ in {1..10}; do
+    if test_explicit_http_proxy >/dev/null 2>&1; then
+      echo "Explicit HTTP proxy is ready."
+      return 0
+    fi
+    sleep 1
+  done
+
+  fail "Explicit HTTP proxy did not respond. Make sure Android Proxi is running."
+}
+
+write_redsocks_config() {
+  say "Writing redsocks config to ${REDSOCKS_CONFIG}..."
+
+  sudo tee "${REDSOCKS_CONFIG}" >/dev/null <<EOF
+base {
+  log_debug = off;
+  log_info = on;
+  log = "stderr";
+  daemon = on;
+  redirector = iptables;
+}
+
+redsocks {
+  local_ip = 127.0.0.1;
+  local_port = ${REDSOCKS_PORT};
+
+  ip = 127.0.0.1;
+  port = ${SOCKS_PORT};
+
+  type = socks5;
+}
+EOF
+}
+
+add_dummy_route() {
+  say "Adding dummy default route..."
+
+  sudo ip link add "${DUMMY_IFACE}" type dummy 2>/dev/null || true
+  sudo ip addr add "${DUMMY_ADDR}" dev "${DUMMY_IFACE}" 2>/dev/null || true
+  sudo ip link set "${DUMMY_IFACE}" up
+  sudo ip route add default dev "${DUMMY_IFACE}" metric 5000 2>/dev/null || true
+}
+
+remove_dummy_route() {
+  say "Removing dummy default route..."
+
+  sudo ip route del default dev "${DUMMY_IFACE}" 2>/dev/null || true
+  sudo ip link del "${DUMMY_IFACE}" 2>/dev/null || true
+}
+
+start_dnscrypt() {
+  require_command "dnscrypt-proxy" "Install it with: sudo pacman -S dnscrypt-proxy"
+  require_command "dig" "Install it with: sudo pacman -S bind"
+
+  say "Starting dnscrypt-proxy..."
+  sudo systemctl restart dnscrypt-proxy
+
+  say "Checking local DNS..."
+
+  for _ in {1..12}; do
+    if dig @127.0.0.1 ifconfig.me +time=2 +tries=1 >/dev/null 2>&1; then
+      echo "Local DNS is ready."
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo
+  sudo systemctl status dnscrypt-proxy --no-pager -l || true
+  echo
+  fail "dnscrypt-proxy did not respond on 127.0.0.1:53."
+}
+
+check_dnscrypt_config() {
+  local config="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
+
+  [[ -f "$config" ]] || fail "Missing $config"
+
+  grep -q "^listen_addresses = \['127.0.0.1:53'\]" "$config" || warn "dnscrypt-proxy listen_addresses may not be set to ['127.0.0.1:53']"
+  grep -q "^server_names = \['cloudflare'\]" "$config" || warn "dnscrypt-proxy server_names may not be ['cloudflare']"
+  grep -q "^force_tcp = true" "$config" || warn "dnscrypt-proxy force_tcp may not be true"
+  grep -q "^http_proxy = 'http://127.0.0.1:8080'" "$config" || warn "dnscrypt-proxy http_proxy may not point to Proxi HTTP proxy"
+}
+
+replace_resolv_conf() {
+  say "Pointing /etc/resolv.conf to local DNS..."
+
+  if [[ ! -e "${RESOLV_BACKUP}" && ! -L "${RESOLV_BACKUP}" ]]; then
+    sudo cp -P /etc/resolv.conf "${RESOLV_BACKUP}" 2>/dev/null || true
+  fi
+
+  sudo rm -f /etc/resolv.conf
+  sudo sh -c 'printf "nameserver 127.0.0.1\noptions edns0\n" > /etc/resolv.conf'
+}
+
+restore_resolv_conf() {
+  say "Restoring /etc/resolv.conf..."
+
+  if [[ -e "${RESOLV_BACKUP}" || -L "${RESOLV_BACKUP}" ]]; then
+    sudo rm -f /etc/resolv.conf
+    sudo cp -P "${RESOLV_BACKUP}" /etc/resolv.conf
+    echo "Restored from ${RESOLV_BACKUP}."
+  else
+    warn "No Proxi resolv.conf backup found. Leaving /etc/resolv.conf unchanged."
+  fi
+}
+
+start_redsocks() {
+  require_command "redsocks" "Install it with: paru -S redsocks or yay -S redsocks"
+
+  write_redsocks_config
+
+  say "Starting redsocks..."
+  sudo pkill redsocks 2>/dev/null || true
+  sudo redsocks -c "${REDSOCKS_CONFIG}"
+
+  sleep 1
+
+  if pgrep redsocks >/dev/null 2>&1; then
+    echo "redsocks is running."
+  else
+    fail "redsocks failed to start."
+  fi
+}
+
+stop_redsocks() {
+  say "Stopping redsocks..."
+  sudo pkill redsocks 2>/dev/null || true
+}
+
+apply_iptables_rules() {
+  say "Applying iptables transparent redirect rules..."
+
+  sudo iptables -t nat -D OUTPUT -p tcp -m owner ! --uid-owner root -j "${PROXI_CHAIN}" 2>/dev/null || true
+  sudo iptables -t nat -F "${PROXI_CHAIN}" 2>/dev/null || true
+  sudo iptables -t nat -X "${PROXI_CHAIN}" 2>/dev/null || true
+
+  sudo iptables -t nat -N "${PROXI_CHAIN}"
+
+  sudo iptables -t nat -A "${PROXI_CHAIN}" -d 127.0.0.0/8 -j RETURN
+  sudo iptables -t nat -A "${PROXI_CHAIN}" -d 10.0.0.0/8 -j RETURN
+  sudo iptables -t nat -A "${PROXI_CHAIN}" -d 172.16.0.0/12 -j RETURN
+  sudo iptables -t nat -A "${PROXI_CHAIN}" -d 192.168.0.0/16 -j RETURN
+
+  # Let local DNS proxy handle DNS directly.
+  sudo iptables -t nat -A "${PROXI_CHAIN}" -p tcp --dport 53 -j RETURN
+
+  sudo iptables -t nat -A "${PROXI_CHAIN}" -p tcp -j REDIRECT --to-ports "${REDSOCKS_PORT}"
+  sudo iptables -t nat -A OUTPUT -p tcp -m owner ! --uid-owner root -j "${PROXI_CHAIN}"
+}
+
+remove_iptables_rules() {
+  say "Removing iptables transparent redirect rules..."
+
+  sudo iptables -t nat -D OUTPUT -p tcp -m owner ! --uid-owner root -j "${PROXI_CHAIN}" 2>/dev/null || true
+  sudo iptables -t nat -F "${PROXI_CHAIN}" 2>/dev/null || true
+  sudo iptables -t nat -X "${PROXI_CHAIN}" 2>/dev/null || true
+}
+
+transparent_curl_test() {
+  unset_proxy_env_in_current_process
+  curl -4 -sS --max-time 15 https://ifconfig.me
+}
+
+transparent_start() {
+  require_device
+  require_command "curl" "Install curl first."
+  require_command "dig" "Install it with: sudo pacman -S bind"
+  check_dnscrypt_config
+
+  say "Starting Proxi transparent mode..."
+
+  # Roll back partial setup if startup fails.
+  trap 'echo; warn "Startup failed. Rolling back partial transparent setup..."; repair_silent' ERR
+
+  unset_proxy_env_in_current_process
+
+  start_forwards
+  health_check_explicit_proxy
+
+  # Important: add dummy route before dnscrypt-proxy.
+  add_dummy_route
+  start_dnscrypt
+  replace_resolv_conf
+  start_redsocks
+  apply_iptables_rules
+
+  echo
+  say "Testing transparent TCP + DNS path..."
+
+  transparent_curl_test
+  echo
+  echo "Transparent mode is working."
+
+  trap - ERR
+}
+
+transparent_stop() {
+  say "Stopping Proxi transparent mode..."
+
+  remove_iptables_rules
+  stop_redsocks
+  remove_dummy_route
+  restore_resolv_conf
+  stop_forwards
+
+  echo "Transparent mode stopped."
+}
+
+repair_silent() {
+  remove_iptables_rules >/dev/null 2>&1 || true
+  stop_redsocks >/dev/null 2>&1 || true
+  remove_dummy_route >/dev/null 2>&1 || true
+  restore_resolv_conf >/dev/null 2>&1 || true
+  stop_forwards >/dev/null 2>&1 || true
+}
+
+repair() {
+  say "Force-cleaning Proxi networking state..."
+
+  remove_iptables_rules
+  stop_redsocks
+  remove_dummy_route
+  restore_resolv_conf
+  stop_forwards
+
+  echo "Repair complete."
+}
+
+transparent_status() {
+  echo "=== ADB / Android ==="
+  status || true
+
+  echo
+  echo "=== Routes ==="
+  ip route || true
+
+  echo
+  echo "=== /etc/resolv.conf ==="
+  ls -l /etc/resolv.conf || true
+  cat /etc/resolv.conf || true
+
+  echo
+  echo "=== dnscrypt-proxy ==="
+  systemctl is-active dnscrypt-proxy || true
+  sudo ss -lntup | grep ':53' || true
+  sudo ss -lnuup | grep ':53' || true
+
+  echo
+  echo "=== redsocks ==="
+  if pgrep redsocks >/dev/null 2>&1; then
+    echo "redsocks is running."
+  else
+    echo "redsocks is not running."
+  fi
+
+  echo
+  echo "=== iptables NAT OUTPUT ==="
+  sudo iptables -t nat -S OUTPUT | grep "${PROXI_CHAIN}" || echo "No OUTPUT PROXI rule."
+
+  echo
+  echo "=== iptables PROXI chain ==="
+  sudo iptables -t nat -S "${PROXI_CHAIN}" 2>/dev/null || echo "No PROXI chain."
+
+  echo
+  echo "=== DNS test ==="
+  dig @127.0.0.1 ifconfig.me +time=2 +tries=1 || true
+
+  echo
+  echo "=== Transparent curl test ==="
+  transparent_curl_test || true
+  echo
+}
+
+doctor() {
+  echo "=== Proxi Doctor ==="
+
+  echo
+  echo "[1] Required commands"
+  for cmd in adb curl dig dnscrypt-proxy redsocks iptables ip ss; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo "OK: $cmd"
+    else
+      echo "MISSING: $cmd"
+    fi
+  done
+
+  echo
+  echo "[2] Android"
+  if adb devices 2>/dev/null | grep -q "device$"; then
+    echo "OK: Android device connected"
+  else
+    echo "FAIL: No authorized Android device"
+  fi
+
+  if adb forward --list 2>/dev/null | grep -q "tcp:${HTTP_PORT}"; then
+    echo "OK: HTTP ADB forward exists"
+  else
+    echo "WARN: HTTP ADB forward missing"
+  fi
+
+  if adb forward --list 2>/dev/null | grep -q "tcp:${SOCKS_PORT}"; then
+    echo "OK: SOCKS ADB forward exists"
+  else
+    echo "WARN: SOCKS ADB forward missing"
+  fi
+
+  if require_adb >/dev/null 2>&1 && android_service_running; then
+    echo "OK: Android ProxyService running"
+  else
+    echo "WARN: Android ProxyService not detected"
+  fi
+
+  echo
+  echo "[3] Explicit proxy"
+  if test_explicit_http_proxy >/dev/null 2>&1; then
+    echo "OK: HTTP proxy works"
+  else
+    echo "FAIL: HTTP proxy test failed"
+  fi
+
+  if test_explicit_socks_proxy >/dev/null 2>&1; then
+    echo "OK: SOCKS5 proxy works"
+  else
+    echo "FAIL: SOCKS5 proxy test failed"
+  fi
+
+  echo
+  echo "[4] DNS"
+  check_dnscrypt_config || true
+
+  if dig @127.0.0.1 ifconfig.me +time=2 +tries=1 >/dev/null 2>&1; then
+    echo "OK: local DNS works"
+  else
+    echo "FAIL: local DNS does not respond"
+  fi
+
+  echo
+  echo "[5] Transparent mode"
+  if ip route | grep -q "default dev ${DUMMY_IFACE}"; then
+    echo "OK: dummy default route exists"
+  else
+    echo "WARN: dummy default route missing"
+  fi
+
+  if pgrep redsocks >/dev/null 2>&1; then
+    echo "OK: redsocks running"
+  else
+    echo "WARN: redsocks not running"
+  fi
+
+  if sudo iptables -t nat -S OUTPUT | grep -q "${PROXI_CHAIN}"; then
+    echo "OK: iptables OUTPUT redirect active"
+  else
+    echo "WARN: iptables OUTPUT redirect missing"
+  fi
+
+  if [[ -f /etc/resolv.conf ]] && grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
+    echo "OK: /etc/resolv.conf points to local DNS"
+  else
+    echo "WARN: /etc/resolv.conf does not point to 127.0.0.1"
+  fi
+
+  if transparent_curl_test >/dev/null 2>&1; then
+    echo "OK: transparent curl works"
+  else
+    echo "WARN: transparent curl failed"
+  fi
+}
+
+logs() {
+  require_adb
+  adb logcat ProxyService:D Socks5Server:D Socks5Handler:D HttpProxyServer:D HttpProxyHandler:D AndroidRuntime:E '*:S'
+}
+
+case "${1:-}" in
+  start)
+    start_forwards
+    health_check_explicit_proxy
+    echo
+    echo "Proxy env vars:"
+    print_env
+    echo
+    echo "To apply them to this shell, run:"
+    echo 'eval "$(proxi env)"'
+    ;;
+
+  stop)
+    stop_forwards
+    ;;
+
+  status)
+    status
+    ;;
+
+  test)
+    test_proxy
+    ;;
+
+  env)
+    print_env
+    ;;
+
+  unset)
+    print_unset
+    ;;
+
+  transparent-start)
+    transparent_start
+    ;;
+
+  transparent-stop)
+    transparent_stop
+    ;;
+
+  transparent-restart)
+    transparent_stop
+    transparent_start
+    ;;
+
+  transparent-status)
+    transparent_status
+    ;;
+
+  doctor)
+    doctor
+    ;;
+
+  repair)
+    repair
+    ;;
+
+  open-android)
+    open_android
+    ;;
+
+  logs)
+    logs
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
